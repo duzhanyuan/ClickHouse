@@ -1,4 +1,4 @@
-#include <DB/DataStreams/GraphiteRollupSortedBlockInputStream.h>
+#include <DataStreams/GraphiteRollupSortedBlockInputStream.h>
 #include <type_traits>
 
 
@@ -7,223 +7,259 @@ namespace DB
 
 namespace ErrorCodes
 {
-	extern const int NO_SUCH_COLUMN_IN_TABLE;
+    extern const int NO_SUCH_COLUMN_IN_TABLE;
 }
 
 
 const Graphite::Pattern * GraphiteRollupSortedBlockInputStream::selectPatternForPath(StringRef path) const
 {
-	for (const auto & pattern : params.patterns)
-		if (!pattern.regexp || pattern.regexp->match(path.data, path.size))
-			return &pattern;
+    for (const auto & pattern : params.patterns)
+        if (!pattern.regexp || pattern.regexp->match(path.data, path.size))
+            return &pattern;
 
-	return nullptr;
+    return nullptr;
 }
 
 
 UInt32 GraphiteRollupSortedBlockInputStream::selectPrecision(const Graphite::Retentions & retentions, time_t time) const
 {
-	static_assert(std::is_signed<time_t>::value, "time_t must be signed type");
+    static_assert(std::is_signed<time_t>::value, "time_t must be signed type");
 
-	for (const auto & retention : retentions)
-	{
-		if (time_of_merge - time >= static_cast<time_t>(retention.age))
-			return retention.precision;
-	}
+    for (const auto & retention : retentions)
+    {
+        if (time_of_merge - time >= static_cast<time_t>(retention.age))
+            return retention.precision;
+    }
 
-	/// Без огрубления.
-	return 1;
+    /// No rounding.
+    return 1;
 }
 
 
-/** Округлить unix timestamp до precision секунд.
-  * При этом, дата не должна измениться. Дата исчисляется с помощью локального часового пояса.
+/** Round the unix timestamp to seconds precision.
+  * In this case, the date should not change. The date is calculated using the local time zone.
   *
-  * Если величина округления не больше часа,
-  *  то, исходя из допущения, что часовые пояса, отличающиеся от UTC на нецелое количество часов не поддерживаются,
-  *  достаточно просто округлить unix timestamp вниз до числа, кратного 3600.
-  * А если величина округления больше,
-  *  то будем подвергать округлению число секунд от начала суток в локальном часовом поясе.
+  * If the rounding value is less than an hour,
+  *  then, assuming that time zones that differ from UTC by a non-integer number of hours are not supported,
+  *  just simply round the unix timestamp down to a multiple of 3600.
+  * And if the rounding value is greater,
+  *  then we will round down the number of seconds from the beginning of the day in the local time zone.
   *
-  * Округление более чем до суток не поддерживается.
+  * Rounding to more than a day is not supported.
   */
 static time_t roundTimeToPrecision(const DateLUTImpl & date_lut, time_t time, UInt32 precision)
 {
-	if (precision <= 3600)
-	{
-		return time / precision * precision;
-	}
-	else
-	{
-		time_t date = date_lut.toDate(time);
-		time_t remainder = time - date;
-		return date + remainder / precision * precision;
-	}
+    if (precision <= 3600)
+    {
+        return time / precision * precision;
+    }
+    else
+    {
+        time_t date = date_lut.toDate(time);
+        time_t remainder = time - date;
+        return date + remainder / precision * precision;
+    }
 }
 
 
 Block GraphiteRollupSortedBlockInputStream::readImpl()
 {
-	if (finished)
-		return Block();
+    if (finished)
+        return Block();
 
-	Block merged_block;
-	ColumnPlainPtrs merged_columns;
+    Block merged_block;
+    ColumnPlainPtrs merged_columns;
 
-	init(merged_block, merged_columns);
-	if (merged_columns.empty())
-		return Block();
+    init(merged_block, merged_columns);
+    if (merged_columns.empty())
+        return Block();
 
-	/// Дополнительная инициализация.
-	if (!current_path.data)
-	{
-		/// Определим максимальный размер состояния агрегатных функций.
-		size_t max_size_of_aggregate_state = 0;
-		for (const auto & pattern : params.patterns)
-			if (pattern.function->sizeOfData() > max_size_of_aggregate_state)
-				max_size_of_aggregate_state = pattern.function->sizeOfData();
+    /// Additional initialization.
+    if (!current_path.data)
+    {
+        size_t max_size_of_aggregate_state = 0;
+        for (const auto & pattern : params.patterns)
+            if (pattern.function->sizeOfData() > max_size_of_aggregate_state)
+                max_size_of_aggregate_state = pattern.function->sizeOfData();
 
-		place_for_aggregate_state.resize(max_size_of_aggregate_state);
+        place_for_aggregate_state.resize(max_size_of_aggregate_state);
 
-		/// Запомним номера столбцов.
-		path_column_num = merged_block.getPositionByName(params.path_column_name);
-		time_column_num = merged_block.getPositionByName(params.time_column_name);
-		value_column_num = merged_block.getPositionByName(params.value_column_name);
-		version_column_num = merged_block.getPositionByName(params.version_column_name);
+        /// Memoize column numbers in block.
+        path_column_num = merged_block.getPositionByName(params.path_column_name);
+        time_column_num = merged_block.getPositionByName(params.time_column_name);
+        value_column_num = merged_block.getPositionByName(params.value_column_name);
+        version_column_num = merged_block.getPositionByName(params.version_column_name);
 
-		for (size_t i = 0; i < num_columns; ++i)
-			if (i != time_column_num && i != value_column_num && i != version_column_num)
-				unmodified_column_numbers.push_back(i);
-	}
+        for (size_t i = 0; i < num_columns; ++i)
+            if (i != time_column_num && i != value_column_num && i != version_column_num)
+                unmodified_column_numbers.push_back(i);
 
-	if (has_collation)
-		merge(merged_columns, queue_with_collation);
-	else
-		merge(merged_columns, queue);
+        if (current_selected_row.empty())
+            current_selected_row.columns.resize(num_columns);
+    }
 
-	return merged_block;
+    if (has_collation)
+        merge(merged_columns, queue_with_collation);
+    else
+        merge(merged_columns, queue);
+
+    return merged_block;
 }
 
 
 template <typename TSortCursor>
 void GraphiteRollupSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, std::priority_queue<TSortCursor> & queue)
 {
-	const DateLUTImpl & date_lut = DateLUT::instance();
+    const DateLUTImpl & date_lut = DateLUT::instance();
 
-	size_t merged_rows = 0;
+    size_t started_rows = 0; /// Number of times startNextRow() has been called.
 
-	/// Вынимаем строки в нужном порядке и кладём в merged_block, пока строк не больше max_block_size
-	while (!queue.empty())
-	{
-		TSortCursor current = queue.top();
+    /// Take rows in needed order and put them into `merged_block` until we get `max_block_size` rows.
+    ///
+    /// Variables starting with current_* refer to the rows previously popped from the queue that will
+    /// contribute towards current output row.
+    /// Variables starting with next_* refer to the row at the top of the queue.
 
-		next_path = current->all_columns[path_column_num]->getDataAt(current->pos);
-		next_time = current->all_columns[time_column_num]->get64(current->pos);
+    while (!queue.empty())
+    {
+        TSortCursor next_cursor = queue.top();
 
-		auto prev_pattern = current_pattern;
-		bool path_differs = is_first || next_path != current_path;
-		is_first = false;
+        StringRef next_path = next_cursor->all_columns[path_column_num]->getDataAt(next_cursor->pos);
+        bool path_differs = is_first || next_path != current_path;
 
-		if (path_differs)
-			current_pattern = selectPatternForPath(next_path);
+        is_first = false;
 
-		if (current_pattern)
-		{
-			UInt32 precision = selectPrecision(current_pattern->retentions, next_time);
-			next_time = roundTimeToPrecision(date_lut, next_time, precision);
-		}
-		/// А если ни один шаблон не сработал - то это понимается как отсутствие необходимости выполнять округление.
+        time_t next_time = next_cursor->all_columns[time_column_num]->get64(next_cursor->pos);
+        /// Is new key before rounding.
+        bool is_new_key = path_differs || next_time != current_time;
 
-		bool is_new_key = path_differs || next_time != current_time;
+        if (is_new_key)
+        {
+            /// Accumulate the row that has maximum version in the previous group of rows wit the same key:
+            if (started_rows)
+                accumulateRow(current_selected_row);
 
-		if (is_new_key)
-		{
-			if (merged_rows)
-			{
-				finishCurrentRow(merged_columns);
+            const Graphite::Pattern * next_pattern = current_pattern;
+            if (path_differs)
+                next_pattern = selectPatternForPath(next_path);
 
-				/// если накопилось достаточно строк
-				if (merged_rows >= max_block_size)
-					return;
-			}
+            time_t next_time_rounded;
+            if (next_pattern)
+            {
+                UInt32 precision = selectPrecision(next_pattern->retentions, next_time);
+                next_time_rounded = roundTimeToPrecision(date_lut, next_time, precision);
+            }
+            else
+            {
+                /// If no pattern has matched - take the value as-is.
+                next_time_rounded = next_time;
+            }
 
-			startNextRow(merged_columns, current);
+            /// Key will be new after rounding. It means new result row.
+            bool will_be_new_key = path_differs || next_time_rounded != current_time_rounded;
 
-			owned_current_block = source_blocks[current.impl->order];
-			current_path = next_path;
-			current_time = next_time;
-			current_max_version = 0;
+            if (will_be_new_key)
+            {
+                if (started_rows)
+                {
+                    finishCurrentRow(merged_columns);
 
-			if (prev_pattern)
-				prev_pattern->function->destroy(place_for_aggregate_state.data());
-			if (current_pattern)
-				current_pattern->function->create(place_for_aggregate_state.data());
+                    /// We have enough rows - return, but don't advance the loop. At the beginning of the
+                    /// next call to merge() the same next_cursor will be processed once more and
+                    /// the next output row will be created from it.
+                    if (started_rows >= max_block_size)
+                        return;
+                }
 
-			++merged_rows;
-		}
+                /// At this point previous row has been fully processed, so we can advance the loop
+                /// (substitute current_* values for next_*, advance the cursor).
 
-		accumulateRow(current);
-		current_max_version = std::max(current_max_version, current->all_columns[version_column_num]->get64(current->pos));
+                startNextRow(merged_columns, next_cursor, next_pattern);
+                ++started_rows;
 
-		queue.pop();
+                current_time_rounded = next_time_rounded;
+            }
 
-		if (!current->isLast())
-		{
-			current->next();
-			queue.push(current);
-		}
-		else
-		{
-			/// Достаём из соответствующего источника следующий блок, если есть.
-			fetchNextBlock(current, queue);
-		}
-	}
+            current_path = next_path;
+            current_time = next_time;
+        }
 
-	/// Запишем данные для последней группы.
-	++merged_rows;
-	finishCurrentRow(merged_columns);
+        /// Within all rows with same key, we should leave only one row with maximum version;
+        /// and for rows with same maximum version - only last row.
+        UInt64 next_version = next_cursor->all_columns[version_column_num]->get64(next_cursor->pos);
+        if (is_new_key || next_version >= current_max_version)
+        {
+            current_max_version = next_version;
+            setRowRef(current_selected_row, next_cursor);
+        }
 
-	finished = true;
+        queue.pop();
 
-	if (current_pattern)
-	{
-		current_pattern->function->destroy(place_for_aggregate_state.data());
-		current_pattern = nullptr;
-	}
+        if (!next_cursor->isLast())
+        {
+            next_cursor->next();
+            queue.push(next_cursor);
+        }
+        else
+        {
+            /// We get the next block from the appropriate source, if there is one.
+            fetchNextBlock(next_cursor, queue);
+        }
+    }
+
+    /// Write result row for the last group.
+    if (started_rows)
+    {
+        accumulateRow(current_selected_row);
+        finishCurrentRow(merged_columns);
+    }
+
+    finished = true;
 }
 
 
 template <class TSortCursor>
-void GraphiteRollupSortedBlockInputStream::startNextRow(ColumnPlainPtrs & merged_columns, TSortCursor & cursor)
+void GraphiteRollupSortedBlockInputStream::startNextRow(ColumnPlainPtrs & merged_columns, TSortCursor & cursor, const Graphite::Pattern * next_pattern)
 {
-	/// Копируем не модифицированные значения столбцов.
-	for (size_t i = 0, size = unmodified_column_numbers.size(); i < size; ++i)
-	{
-		size_t j = unmodified_column_numbers[i];
-		merged_columns[j]->insertFrom(*cursor->all_columns[j], cursor->pos);
-	}
+    /// Copy unmodified column values.
+    for (size_t i = 0, size = unmodified_column_numbers.size(); i < size; ++i)
+    {
+        size_t j = unmodified_column_numbers[i];
+        merged_columns[j]->insertFrom(*cursor->all_columns[j], cursor->pos);
+    }
 
-	if (!current_pattern)
-		merged_columns[value_column_num]->insertFrom(*cursor->all_columns[value_column_num], cursor->pos);
+    if (next_pattern)
+    {
+        next_pattern->function->create(place_for_aggregate_state.data());
+        aggregate_state_created = true;
+    }
+
+    current_pattern = next_pattern;
 }
 
 
 void GraphiteRollupSortedBlockInputStream::finishCurrentRow(ColumnPlainPtrs & merged_columns)
 {
-	/// Вставляем вычисленные значения столбцов time, value, version.
-	merged_columns[time_column_num]->insert(UInt64(current_time));
-	merged_columns[version_column_num]->insert(current_max_version);
+    /// Insert calculated values of the columns `time`, `value`, `version`.
+    merged_columns[time_column_num]->insert(UInt64(current_time_rounded));
+    merged_columns[version_column_num]->insert(current_max_version);
 
-	if (current_pattern)
-		current_pattern->function->insertResultInto(place_for_aggregate_state.data(), *merged_columns[value_column_num]);
+    if (aggregate_state_created)
+    {
+        current_pattern->function->insertResultInto(place_for_aggregate_state.data(), *merged_columns[value_column_num]);
+        current_pattern->function->destroy(place_for_aggregate_state.data());
+        aggregate_state_created = false;
+    }
+    else
+        merged_columns[value_column_num]->insertFrom(
+                *current_selected_row.columns[value_column_num], current_selected_row.row_num);
 }
 
 
-template <class TSortCursor>
-void GraphiteRollupSortedBlockInputStream::accumulateRow(TSortCursor & cursor)
+void GraphiteRollupSortedBlockInputStream::accumulateRow(RowRef & row)
 {
-	if (current_pattern)
-		current_pattern->function->add(place_for_aggregate_state.data(), &cursor->all_columns[value_column_num], cursor->pos);
+    if (aggregate_state_created)
+        current_pattern->function->add(place_for_aggregate_state.data(), &row.columns[value_column_num], row.row_num, nullptr);
 }
 
 }

@@ -1,79 +1,108 @@
 #include "MetricsTransmitter.h"
 
+#include <Poco/Util/Application.h>
+#include <Poco/Util/LayeredConfiguration.h>
 #include <daemon/BaseDaemon.h>
-#include <DB/Common/setThreadName.h>
-#include <DB/Common/CurrentMetrics.h>
-
+#include <Common/CurrentMetrics.h>
+#include <Common/Exception.h>
+#include <Common/setThreadName.h>
+#include <Interpreters/AsynchronousMetrics.h>
 
 namespace DB
 {
-
 MetricsTransmitter::~MetricsTransmitter()
 {
-	try
-	{
-		{
-			std::lock_guard<std::mutex> lock{mutex};
-			quit = true;
-		}
+    try
+    {
+        {
+            std::lock_guard<std::mutex> lock{mutex};
+            quit = true;
+        }
 
-		cond.notify_one();
+        cond.notify_one();
 
-		thread.join();
-	}
-	catch (...)
-	{
-		DB::tryLogCurrentException(__FUNCTION__);
-	}
+        thread.join();
+    }
+    catch (...)
+    {
+        DB::tryLogCurrentException(__PRETTY_FUNCTION__);
+    }
 }
 
 
 void MetricsTransmitter::run()
 {
-	setThreadName("MetricsTransmit");
+    auto & config = Poco::Util::Application::instance().config();
+    auto interval = config.getInt(config_name + ".interval", 60);
 
-	const auto get_next_minute = [] {
-		return std::chrono::time_point_cast<std::chrono::minutes, std::chrono::system_clock>(
-			std::chrono::system_clock::now() + std::chrono::minutes(1)
-		);
-	};
+    const std::string thread_name = "MericsTrns " + std::to_string(interval) + "s";
+    setThreadName(thread_name.c_str());
 
-	std::unique_lock<std::mutex> lock{mutex};
+    const auto get_next_time = [](size_t seconds) {
+        /// To avoid time drift and transmit values exactly each interval:
+        ///  next time aligned to system seconds
+        /// (60s -> every minute at 00 seconds, 5s -> every minute:[00, 05, 15 ... 55]s, 3600 -> every hour:00:00
+        return std::chrono::system_clock::time_point(
+            (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()) / seconds) * seconds
+            + std::chrono::seconds(seconds));
+    };
 
-	while (true)
-	{
-		if (cond.wait_until(lock, get_next_minute(), [this] { return quit; }))
-			break;
+    std::vector<ProfileEvents::Count> prev_counters(ProfileEvents::end());
 
-		transmit();
-	}
+    std::unique_lock<std::mutex> lock{mutex};
+
+    while (true)
+    {
+        if (cond.wait_until(lock, get_next_time(interval), [this] { return quit; }))
+            break;
+
+        transmit(prev_counters);
+    }
 }
 
 
-void MetricsTransmitter::transmit()
+void MetricsTransmitter::transmit(std::vector<ProfileEvents::Count> & prev_counters)
 {
-	GraphiteWriter::KeyValueVector<ssize_t> key_vals{};
-	key_vals.reserve(ProfileEvents::END + CurrentMetrics::END);
+    auto & config = Poco::Util::Application::instance().config();
+    auto async_metrics_values = async_metrics.getValues();
 
-	for (size_t i = 0; i < ProfileEvents::END; ++i)
-	{
-		const auto counter = ProfileEvents::counters[i].load(std::memory_order_relaxed);
-		const auto counter_increment = counter - prev_counters[i].load(std::memory_order_relaxed);
-		prev_counters[i].store(counter, std::memory_order_relaxed);
+    GraphiteWriter::KeyValueVector<ssize_t> key_vals{};
+    key_vals.reserve(ProfileEvents::end() + CurrentMetrics::end() + async_metrics_values.size());
 
-		std::string key {ProfileEvents::getDescription(static_cast<ProfileEvents::Event>(i))};
-		key_vals.emplace_back(event_path_prefix + key, counter_increment);
-	}
 
-	for (size_t i = 0; i < CurrentMetrics::END; ++i)
-	{
-		const auto value = CurrentMetrics::values[i].load(std::memory_order_relaxed);
+    if (config.getBool(config_name + ".events", true))
+    {
+        for (size_t i = 0, end = ProfileEvents::end(); i < end; ++i)
+        {
+            const auto counter = ProfileEvents::counters[i].load(std::memory_order_relaxed);
+            const auto counter_increment = counter - prev_counters[i];
+            prev_counters[i] = counter;
 
-		std::string key {CurrentMetrics::getDescription(static_cast<CurrentMetrics::Metric>(i))};
-		key_vals.emplace_back(metrics_path_prefix + key, value);
-	}
+            std::string key{ProfileEvents::getDescription(static_cast<ProfileEvents::Event>(i))};
+            key_vals.emplace_back(profile_events_path_prefix + key, counter_increment);
+        }
+    }
 
-	BaseDaemon::instance().writeToGraphite(key_vals);
+    if (config.getBool(config_name + ".metrics", true))
+    {
+        for (size_t i = 0, end = CurrentMetrics::end(); i < end; ++i)
+        {
+            const auto value = CurrentMetrics::values[i].load(std::memory_order_relaxed);
+
+            std::string key{CurrentMetrics::getDescription(static_cast<CurrentMetrics::Metric>(i))};
+            key_vals.emplace_back(current_metrics_path_prefix + key, value);
+        }
+    }
+
+    if (config.getBool(config_name + ".asynchronous_metrics", true))
+    {
+        for (const auto & name_value : async_metrics_values)
+        {
+            key_vals.emplace_back(asynchronous_metrics_path_prefix + name_value.first, name_value.second);
+        }
+    }
+
+    if (key_vals.size())
+        BaseDaemon::instance().writeToGraphite(key_vals, config_name);
 }
-
 }

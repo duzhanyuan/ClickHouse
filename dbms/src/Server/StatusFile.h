@@ -8,17 +8,17 @@ namespace DB
 {
 
 
-/** Обеспечивает, что с одной директорией с данными может одновременно работать не более одного сервера.
+/** Provides that no more than one server works with one data directory.
   */
 class StatusFile : private boost::noncopyable
 {
 public:
-	StatusFile(const std::string & path_);
-	~StatusFile();
+    StatusFile(const std::string & path_);
+    ~StatusFile();
 
 private:
-	const std::string path;
-	int fd = -1;
+    const std::string path;
+    int fd = -1;
 };
 
 

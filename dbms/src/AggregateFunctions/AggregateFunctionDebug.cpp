@@ -1,90 +1,92 @@
-#include <DB/AggregateFunctions/INullaryAggregateFunction.h>
-#include <DB/AggregateFunctions/AggregateFunctionFactory.h>
-#include <DB/DataTypes/DataTypesNumberFixed.h>
-#include <DB/Columns/ColumnsNumber.h>
+#include <AggregateFunctions/INullaryAggregateFunction.h>
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Columns/ColumnsNumber.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
 
 
 namespace DB
 {
 
 
-/** Управление состояниями агрегатных функций делается нетривиальным образом:
-  * - память для них нужно выделяется в пуле,
-  *   указатели на эти состояния могут передаваться между различными структурами данных,
-  *   при этом нельзя сделать RAII-обёртки для каждого отдельного состояния.
-  * Подробнее см. Aggregator.h.
+/** State management of aggregate functions is done in a non-trivial way:
+  * - the memory for them needs to be allocated in the pool,
+  *   pointers to these states can be passed between different data structures,
+  *   herewith, you can not make RAII wrappers for each individual state.
+  * For more information, see Aggregator.h.
   *
-  * В связи с этим, возникают трудно-отлаживаемые баги.
-  * Для упрощения воспроизведения багов, была написана агрегатная функция debug,
-  *  и её исходники решено не удалять после отладки.
+  * In this regard, there are difficult-debugging bugs.
+  * To simplify the playback of bugs, an aggregate `debug` function was written,
+  *  and its source code is decided not to delete after debugging.
   *
-  * Эта агрегатная функция принимает ноль аргументов и ничего не делает.
-  * Но у неё сделано состояние, которое нетривиально создаётся и уничтожается.
+  * This aggregate function takes zero arguments and does nothing.
+  * But it has a state that is non-trivially created and destroyed.
   */
 
 
 struct AggregateFunctionDebugData
 {
-	std::unique_ptr<size_t> ptr { new size_t(0xABCDEF01DEADBEEF) };
-	AggregateFunctionDebugData() {}
-	~AggregateFunctionDebugData()
-	{
-		if (*ptr != 0xABCDEF01DEADBEEF)
-		{
-			std::cerr << "Bug!";
-			abort();
-		}
+    std::unique_ptr<size_t> ptr { new size_t(0xABCDEF01DEADBEEF) };
+    AggregateFunctionDebugData() {}
+    ~AggregateFunctionDebugData()
+    {
+        if (*ptr != 0xABCDEF01DEADBEEF)
+        {
+            std::cerr << "Bug!";
+            abort();
+        }
 
-		ptr.reset();
-	}
+        ptr.reset();
+    }
 };
 
 
 class AggregateFunctionDebug final : public INullaryAggregateFunction<AggregateFunctionDebugData, AggregateFunctionDebug>
 {
 public:
-	String getName() const override { return "debug"; }
+    String getName() const override { return "debug"; }
 
-	DataTypePtr getReturnType() const override
-	{
-		return std::make_shared<DataTypeUInt8>();
-	}
+    DataTypePtr getReturnType() const override
+    {
+        return std::make_shared<DataTypeUInt8>();
+    }
 
-	void addImpl(AggregateDataPtr place) const
-	{
-	}
+    void addImpl(AggregateDataPtr place) const
+    {
+    }
 
-	void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs) const override
-	{
-	}
+    void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena * arena) const override
+    {
+    }
 
-	void serialize(ConstAggregateDataPtr place, WriteBuffer & buf) const override
-	{
-		writeBinary(UInt8(0), buf);
-	}
+    void serialize(ConstAggregateDataPtr place, WriteBuffer & buf) const override
+    {
+        writeBinary(UInt8(0), buf);
+    }
 
-	void deserialize(AggregateDataPtr place, ReadBuffer & buf) const override
-	{
-		UInt8 tmp;
-		readBinary(tmp, buf);
-	}
+    void deserialize(AggregateDataPtr place, ReadBuffer & buf, Arena *) const override
+    {
+        UInt8 tmp;
+        readBinary(tmp, buf);
+    }
 
-	void insertResultInto(ConstAggregateDataPtr place, IColumn & to) const override
-	{
-		static_cast<ColumnUInt8 &>(to).getData().push_back(0);
-	}
+    void insertResultInto(ConstAggregateDataPtr place, IColumn & to) const override
+    {
+        static_cast<ColumnUInt8 &>(to).getData().push_back(0);
+    }
 };
 
 
 AggregateFunctionPtr createAggregateFunctionDebug(const std::string & name, const DataTypes & argument_types)
 {
-	return std::make_shared<AggregateFunctionDebug>();
+    return std::make_shared<AggregateFunctionDebug>();
 }
 
 
 void registerAggregateFunctionDebug(AggregateFunctionFactory & factory)
 {
-	factory.registerFunction("debug", createAggregateFunctionDebug);
+    factory.registerFunction("debug", createAggregateFunctionDebug);
 }
 
 }

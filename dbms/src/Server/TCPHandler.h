@@ -1,17 +1,20 @@
 #pragma once
 
-#include <DB/Core/Protocol.h>
-#include <DB/Core/QueryProcessingStage.h>
-
-#include <DB/IO/ReadHelpers.h>
-#include <DB/IO/WriteHelpers.h>
-
-#include <DB/DataStreams/BlockIO.h>
-
-#include <DB/Common/Stopwatch.h>
-#include <DB/Common/CurrentMetrics.h>
-
+#include <Core/Protocol.h>
+#include <Core/QueryProcessingStage.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
+#include <DataStreams/BlockIO.h>
+#include <Common/Stopwatch.h>
+#include <Common/CurrentMetrics.h>
+#include <Core/Progress.h>
 #include "Server.h"
+
+
+namespace CurrentMetrics
+{
+    extern const Metric TCPConnection;
+}
 
 
 namespace DB
@@ -21,118 +24,123 @@ namespace DB
 /// State of query processing.
 struct QueryState
 {
-	/// Identifier of the query.
-	String query_id;
+    /// Identifier of the query.
+    String query_id;
 
-	QueryProcessingStage::Enum stage = QueryProcessingStage::Complete;
-	Protocol::Compression::Enum compression = Protocol::Compression::Disable;
+    QueryProcessingStage::Enum stage = QueryProcessingStage::Complete;
+    Protocol::Compression::Enum compression = Protocol::Compression::Disable;
 
-	/// From where to read data for INSERT.
-	std::shared_ptr<ReadBuffer> maybe_compressed_in;
-	BlockInputStreamPtr block_in;
+    /// From where to read data for INSERT.
+    std::shared_ptr<ReadBuffer> maybe_compressed_in;
+    BlockInputStreamPtr block_in;
 
-	/// Where to write result data.
-	std::shared_ptr<WriteBuffer> maybe_compressed_out;
-	BlockOutputStreamPtr block_out;
+    /// Where to write result data.
+    std::shared_ptr<WriteBuffer> maybe_compressed_out;
+    BlockOutputStreamPtr block_out;
 
-	/// Query text.
-	String query;
-	/// Streams of blocks, that are processing the query.
-	BlockIO io;
+    /// Query text.
+    String query;
+    /// Streams of blocks, that are processing the query.
+    BlockIO io;
 
-	/// Отменен ли запрос
-	bool is_cancelled = false;
-	/// Пустой или нет
-	bool is_empty = true;
-	/// Данные были отправлены.
-	bool sent_all_data = false;
-	/// Запрос требует приёма данных от клиента (INSERT, но не INSERT SELECT).
-	bool need_receive_data_for_insert = false;
+    /// Is request cancelled
+    bool is_cancelled = false;
+    /// empty or not
+    bool is_empty = true;
+    /// Data was sent.
+    bool sent_all_data = false;
+    /// Request requires data from the client (INSERT, but not INSERT SELECT).
+    bool need_receive_data_for_insert = false;
 
-	/// Для вывода прогресса - разница после предыдущей отправки прогресса.
-	Progress progress;
+    /// To output progress, the difference after the previous sending of progress.
+    Progress progress;
 
 
-	void reset()
-	{
-		*this = QueryState();
-	}
+    void reset()
+    {
+        *this = QueryState();
+    }
 
-	bool empty()
-	{
-		return is_empty;
-	}
+    bool empty()
+    {
+        return is_empty;
+    }
 };
 
 
 class TCPHandler : public Poco::Net::TCPServerConnection
 {
 public:
-	TCPHandler(Server & server_, const Poco::Net::StreamSocket & socket_)
-		: Poco::Net::TCPServerConnection(socket_), server(server_),
-		log(&Logger::get("TCPHandler")), client_revision(0),
-		connection_context(*server.global_context), query_context(connection_context)
-	{
-	}
+    TCPHandler(Server & server_, const Poco::Net::StreamSocket & socket_)
+        : Poco::Net::TCPServerConnection(socket_), server(server_),
+        log(&Logger::get("TCPHandler")), client_revision(0),
+        connection_context(*server.global_context), query_context(connection_context)
+    {
+    }
 
-	void run();
+    void run();
 
 private:
-	Server & server;
-	Logger * log;
+    Server & server;
+    Logger * log;
 
-	UInt64 client_revision;
+    String client_name;
+    UInt64 client_version_major = 0;
+    UInt64 client_version_minor = 0;
+    UInt64 client_revision = 0;
 
-	Context connection_context;
-	Context query_context;
+    Context connection_context;
+    Context query_context;
 
-	/// Потоки для чтения/записи из/в сокет соединения с клиентом.
-	std::shared_ptr<ReadBuffer> in;
-	std::shared_ptr<WriteBuffer> out;
+    /// Streams for reading/writing from/to client connection socket.
+    std::shared_ptr<ReadBuffer> in;
+    std::shared_ptr<WriteBuffer> out;
 
-	/// Время после последней проверки остановки запроса и отправки прогресса.
-	Stopwatch after_check_cancelled;
-	Stopwatch after_send_progress;
+    /// Time after the last check to stop the request and send the progress.
+    Stopwatch after_check_cancelled;
+    Stopwatch after_send_progress;
 
-	String default_database;
+    String default_database;
 
-	/// На данный момент, поддерживается одновременное выполнение только одного запроса в соединении.
-	QueryState state;
+    /// At the moment, only one ongoing query in the connection is supported at a time.
+    QueryState state;
 
-	CurrentMetrics::Increment metric_increment{CurrentMetrics::TCPConnection};
+    CurrentMetrics::Increment metric_increment{CurrentMetrics::TCPConnection};
 
 
-	void runImpl();
+    void runImpl();
 
-	void receiveHello();
-	bool receivePacket();
-	void receiveQuery();
-	bool receiveData();
-	void readData(const Settings & global_settings);
+    void receiveHello();
+    bool receivePacket();
+    void receiveQuery();
+    bool receiveData();
+    void readData(const Settings & global_settings);
 
-	/// Обработать запрос INSERT
-	void processInsertQuery(const Settings & global_settings);
+    /// Process INSERT query
+    void processInsertQuery(const Settings & global_settings);
 
-	/// Обработать запрос, который не требует приёма блоков данных от клиента
-	void processOrdinaryQuery();
+    /// Process a request that does not require the receiving of data blocks from the client
+    void processOrdinaryQuery();
 
-	void sendHello();
-	void sendData(Block & block);	/// Записать в сеть блок.
-	void sendException(const Exception & e);
-	void sendProgress();
-	void sendEndOfStream();
-	void sendProfileInfo();
-	void sendTotals();
-	void sendExtremes();
+    void processTablesStatusRequest();
 
-	/// Создаёт state.block_in/block_out для чтения/записи блоков, в зависимости от того, включено ли сжатие.
-	void initBlockInput();
-	void initBlockOutput();
+    void sendHello();
+    void sendData(Block & block);    /// Write a block to the network.
+    void sendException(const Exception & e);
+    void sendProgress();
+    void sendEndOfStream();
+    void sendProfileInfo();
+    void sendTotals();
+    void sendExtremes();
 
-	bool isQueryCancelled();
+    /// Creates state.block_in/block_out for blocks read/write, depending on whether compression is enabled.
+    void initBlockInput();
+    void initBlockOutput();
 
-	/// Эта функция вызывается из разных потоков.
-	void updateProgress(const Progress & value);
+    bool isQueryCancelled();
+
+    /// This function is called from different threads.
+    void updateProgress(const Progress & value);
 };
 
 

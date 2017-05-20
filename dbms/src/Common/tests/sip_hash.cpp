@@ -4,9 +4,9 @@
 #include <iostream>
 #include <iomanip>
 
-#include <DB/Common/SipHash.h>
+#include <Common/SipHash.h>
 
-/// Адаптированный вариант https://www.131002.net/siphash/siphash24.c
+/// Adapted version https://www.131002.net/siphash/siphash24.c
 
 /*
    SipHash-2-4 output with
@@ -95,14 +95,14 @@ int test_vectors()
 
   union
   {
-	  char out[16];
-	  uint64_t out64[2];
+      char out[16];
+      uint64_t out64[2];
   };
 
   union
   {
-	  char k[16];
-	  uint64_t k64[2];
+      char k[16];
+      uint64_t k64[2];
   };
 
   int i;
@@ -114,17 +114,17 @@ int test_vectors()
   {
     in[i] = i;
 
-	size_t part = i == 0 ? 0 : (rand() % i);
+    size_t part = i == 0 ? 0 : (rand() % i);
 
-	SipHash hash(k64[0], k64[1]);
+    SipHash hash(k64[0], k64[1]);
 
-	hash.update(in, part);
-	hash.update(in + part, i - part);
-	
-	hash.get128(out);
+    hash.update(in, part);
+    hash.update(in + part, i - part);
 
-	uint64_t test_vector;
-	memcpy(&test_vector, vectors[i], 8);
+    hash.get128(out);
+
+    uint64_t test_vector;
+    memcpy(&test_vector, vectors[i], 8);
 
     if ((out64[0] ^ out64[1]) != test_vector)
     {
@@ -139,15 +139,15 @@ int test_vectors()
 
 int main(int argc, char ** argv)
 {
-	size_t n = 100000;
+    size_t n = 100000;
 
-	size_t i = 0;
-	for (; i < n; ++i)
-		if (!test_vectors())
-			break;
+    size_t i = 0;
+    for (; i < n; ++i)
+        if (!test_vectors())
+            break;
 
-	if (i == n)
-		std::cerr << "test vectors ok" << std::endl;
+    if (i == n)
+        std::cerr << "test vectors ok" << std::endl;
 
-	return 0;
+    return 0;
 }

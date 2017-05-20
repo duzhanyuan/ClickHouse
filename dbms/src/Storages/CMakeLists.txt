@@ -1,3 +1,5 @@
-IF(TESTS)
-	add_subdirectory (tests)
-ENDIF(TESTS)
+add_subdirectory (System)
+
+if (ENABLE_TESTS)
+    add_subdirectory (tests)
+endif ()

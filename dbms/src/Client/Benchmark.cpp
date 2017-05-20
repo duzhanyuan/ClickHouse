@@ -12,34 +12,36 @@
 #include <Poco/File.h>
 #include <Poco/Util/Application.h>
 
-#include <DB/Common/Stopwatch.h>
-#include <DB/Common/ThreadPool.h>
-#include <DB/AggregateFunctions/ReservoirSampler.h>
+#include <Common/Stopwatch.h>
+#include <Common/ThreadPool.h>
+#include <AggregateFunctions/ReservoirSampler.h>
 
 #include <boost/program_options.hpp>
 
-#include <DB/Common/ConcurrentBoundedQueue.h>
+#include <Common/ConcurrentBoundedQueue.h>
 
-#include <DB/Common/Exception.h>
-#include <DB/Common/randomSeed.h>
-#include <DB/Core/Types.h>
+#include <Common/Exception.h>
+#include <Common/randomSeed.h>
+#include <Core/Types.h>
 
-#include <DB/IO/ReadBufferFromFileDescriptor.h>
-#include <DB/IO/WriteBufferFromFileDescriptor.h>
-#include <DB/IO/ReadHelpers.h>
-#include <DB/IO/WriteHelpers.h>
+#include <IO/ReadBufferFromFileDescriptor.h>
+#include <IO/WriteBufferFromFileDescriptor.h>
+#include <IO/WriteBufferFromFile.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
+#include <IO/Operators.h>
 
-#include <DB/DataStreams/RemoteBlockInputStream.h>
+#include <DataStreams/RemoteBlockInputStream.h>
 
-#include <DB/Interpreters/Context.h>
+#include <Interpreters/Context.h>
 
-#include <DB/Client/Connection.h>
+#include <Client/Connection.h>
 
 #include "InterruptListener.h"
 
 
-/** Инструмент для измерения производительности ClickHouse
-  *  при выполнении запросов с фиксированным количеством одновременных запросов.
+/** A tool for evaluating ClickHouse performance.
+  * The tool emulates a case with fixed amount of simultaneously executing queries.
   */
 
 namespace DB
@@ -47,379 +49,439 @@ namespace DB
 
 namespace ErrorCodes
 {
-	extern const int POCO_EXCEPTION;
-	extern const int STD_EXCEPTION;
-	extern const int UNKNOWN_EXCEPTION;
+    extern const int POCO_EXCEPTION;
+    extern const int STD_EXCEPTION;
+    extern const int UNKNOWN_EXCEPTION;
+    extern const int BAD_ARGUMENTS;
 }
 
 class Benchmark
 {
 public:
-	Benchmark(unsigned concurrency_, double delay_,
-			const String & host_, UInt16 port_, const String & default_database_,
-			const String & user_, const String & password_, const String & stage,
-			bool randomize_,
-			const Settings & settings_)
-		: concurrency(concurrency_), delay(delay_), queue(concurrency),
-		connections(concurrency, host_, port_, default_database_, user_, password_),
-		randomize(randomize_),
-		settings(settings_), pool(concurrency)
-	{
-		std::cerr << std::fixed << std::setprecision(3);
+    Benchmark(unsigned concurrency_, double delay_,
+            const String & host_, UInt16 port_, const String & default_database_,
+            const String & user_, const String & password_, const String & stage,
+            bool randomize_, size_t max_iterations_, double max_time_,
+            const String & json_path_, const Settings & settings_)
+        :
+        concurrency(concurrency_), delay(delay_), queue(concurrency),
+        connections(concurrency, host_, port_, default_database_, user_, password_),
+        randomize(randomize_), max_iterations(max_iterations_), max_time(max_time_),
+        json_path(json_path_), settings(settings_), pool(concurrency)
+    {
+        std::cerr << std::fixed << std::setprecision(3);
 
-		if (stage == "complete")
-			query_processing_stage = QueryProcessingStage::Complete;
-		else if (stage == "fetch_columns")
-			query_processing_stage = QueryProcessingStage::FetchColumns;
-		else if (stage == "with_mergeable_state")
-			query_processing_stage = QueryProcessingStage::WithMergeableState;
-		else
-			throw Exception("Unknown query processing stage: " + stage, ErrorCodes::BAD_ARGUMENTS);
+        if (stage == "complete")
+            query_processing_stage = QueryProcessingStage::Complete;
+        else if (stage == "fetch_columns")
+            query_processing_stage = QueryProcessingStage::FetchColumns;
+        else if (stage == "with_mergeable_state")
+            query_processing_stage = QueryProcessingStage::WithMergeableState;
+        else
+            throw Exception("Unknown query processing stage: " + stage, ErrorCodes::BAD_ARGUMENTS);
 
-		readQueries();
-		run();
-	}
+        if (!json_path.empty() && Poco::File(json_path).exists()) /// Clear file with previous results
+        {
+            Poco::File(json_path).remove();
+        }
+
+        readQueries();
+        run();
+    }
 
 private:
-	using Query = std::string;
+    using Query = std::string;
 
-	unsigned concurrency;
-	double delay;
+    unsigned concurrency;
+    double delay;
 
-	using Queries = std::vector<Query>;
-	Queries queries;
+    using Queries = std::vector<Query>;
+    Queries queries;
 
-	using Queue = ConcurrentBoundedQueue<Query>;
-	Queue queue;
+    using Queue = ConcurrentBoundedQueue<Query>;
+    Queue queue;
 
-	ConnectionPool connections;
-	bool randomize;
-	Settings settings;
-	QueryProcessingStage::Enum query_processing_stage;
+    ConnectionPool connections;
+    bool randomize;
+    size_t max_iterations;
+    double max_time;
+    String json_path;
+    Settings settings;
+    QueryProcessingStage::Enum query_processing_stage;
 
-	struct Stats
-	{
-		Stopwatch watch;
-		size_t queries = 0;
-		size_t read_rows = 0;
-		size_t read_bytes = 0;
-		size_t result_rows = 0;
-		size_t result_bytes = 0;
+    /// Don't execute new queries after timelimit or SIGINT or exception
+    std::atomic<bool> shutdown{false};
 
-		using Sampler = ReservoirSampler<double>;
-		Sampler sampler {1 << 16};
+    struct Stats
+    {
+        Stopwatch watch;
+        std::atomic<size_t> queries{0};
+        size_t read_rows = 0;
+        size_t read_bytes = 0;
+        size_t result_rows = 0;
+        size_t result_bytes = 0;
 
-		void add(double seconds, size_t read_rows_inc, size_t read_bytes_inc, size_t result_rows_inc, size_t result_bytes_inc)
-		{
-			++queries;
-			read_rows += read_rows_inc;
-			read_bytes += read_bytes_inc;
-			result_rows += result_rows_inc;
-			result_bytes += result_bytes_inc;
-			sampler.insert(seconds);
-		}
+        using Sampler = ReservoirSampler<double>;
+        Sampler sampler {1 << 16};
 
-		void clear()
-		{
-			watch.restart();
-			queries = 0;
-			read_rows = 0;
-			read_bytes = 0;
-			result_rows = 0;
-			result_bytes = 0;
-			sampler.clear();
-		}
-	};
+        void add(double seconds, size_t read_rows_inc, size_t read_bytes_inc, size_t result_rows_inc, size_t result_bytes_inc)
+        {
+            ++queries;
+            read_rows += read_rows_inc;
+            read_bytes += read_bytes_inc;
+            result_rows += result_rows_inc;
+            result_bytes += result_bytes_inc;
+            sampler.insert(seconds);
+        }
 
-	Stats info_per_interval;
-	Stats info_total;
+        void clear()
+        {
+            watch.restart();
+            queries = 0;
+            read_rows = 0;
+            read_bytes = 0;
+            result_rows = 0;
+            result_bytes = 0;
+            sampler.clear();
+        }
+    };
 
-	std::mutex mutex;
+    Stats info_per_interval;
+    Stats info_total;
+    Stopwatch delay_watch;
 
-	ThreadPool pool;
+    std::mutex mutex;
 
-
-	void readQueries()
-	{
-		ReadBufferFromFileDescriptor in(STDIN_FILENO);
-
-		while (!in.eof())
-		{
-			std::string query;
-			readText(query, in);
-			assertChar('\n', in);
-
-			if (!query.empty())
-				queries.emplace_back(query);
-		}
-
-		if (queries.empty())
-			throw Exception("Empty list of queries.");
-
-		std::cerr << "Loaded " << queries.size() << " queries.\n";
-	}
+    ThreadPool pool;
 
 
-	void printNumberOfQueriesExecuted(size_t num)
-	{
-		std::cerr << "\nQueries executed: " << num;
-		if (queries.size() > 1)
-			std::cerr << " (" << (num * 100.0 / queries.size()) << "%)";
-		std::cerr << ".\n";
-	}
+    void readQueries()
+    {
+        ReadBufferFromFileDescriptor in(STDIN_FILENO);
+
+        while (!in.eof())
+        {
+            std::string query;
+            readText(query, in);
+            assertChar('\n', in);
+
+            if (!query.empty())
+                queries.emplace_back(query);
+        }
+
+        if (queries.empty())
+            throw Exception("Empty list of queries.");
+
+        std::cerr << "Loaded " << queries.size() << " queries.\n";
+    }
 
 
-	void run()
-	{
-		std::mt19937 generator(randomSeed());
-		std::uniform_int_distribution<size_t> distribution(0, queries.size() - 1);
+    void printNumberOfQueriesExecuted(size_t num)
+    {
+        std::cerr << "\nQueries executed: " << num;
+        if (queries.size() > 1)
+            std::cerr << " (" << (num * 100.0 / queries.size()) << "%)";
+        std::cerr << ".\n";
+    }
 
-		for (size_t i = 0; i < concurrency; ++i)
-			pool.schedule(std::bind(&Benchmark::thread, this, connections.IConnectionPool::get()));
+    /// Try push new query and check cancellation conditions
+    bool tryPushQueryInteractively(const String & query, InterruptListener & interrupt_listener)
+    {
+        bool inserted = false;
 
-		InterruptListener interrupt_listener;
+        while (!inserted)
+        {
+            inserted = queue.tryPush(query, 100);
 
-		info_per_interval.watch.restart();
-		Stopwatch watch;
+            if (shutdown)
+            {
+                /// An exception occurred in a worker
+                return false;
+            }
 
-		/// В цикле, кладём все запросы в очередь.
-		for (size_t i = 0; !interrupt_listener.check(); ++i)
-		{
-			if (i >= queries.size())
-				i = 0;
+            if (max_time > 0 && info_total.watch.elapsedSeconds() >= max_time)
+            {
+                std::cout << "Stopping launch of queries. Requested time limit is exhausted.\n";
+                return false;
+            }
 
-			size_t query_index = randomize
-				? distribution(generator)
-				: i;
+            if (interrupt_listener.check())
+            {
+                std::cout << "Stopping launch of queries. SIGINT recieved.\n";
+                return false;
+            }
 
-			queue.push(queries[query_index]);
+            if (delay > 0 && delay_watch.elapsedSeconds() > delay)
+            {
+                printNumberOfQueriesExecuted(info_total.queries);
+                report(info_per_interval);
+                delay_watch.restart();
+            }
+        };
 
-			if (watch.elapsedSeconds() > delay)
-			{
-				auto total_queries = 0;
-				{
-					std::lock_guard<std::mutex> lock(mutex);
-					total_queries = info_total.queries;
-				}
-				printNumberOfQueriesExecuted(total_queries);
+        return true;
+    }
 
-				report(info_per_interval);
-				watch.restart();
-			}
-		}
+    void run()
+    {
+        std::mt19937 generator(randomSeed());
+        std::uniform_int_distribution<size_t> distribution(0, queries.size() - 1);
 
-		/// Попросим потоки завершиться.
-		for (size_t i = 0; i < concurrency; ++i)
-			queue.push("");
+        for (size_t i = 0; i < concurrency; ++i)
+            pool.schedule(std::bind(&Benchmark::thread, this, connections.get()));
 
-		pool.wait();
+        InterruptListener interrupt_listener;
+        info_per_interval.watch.restart();
+        delay_watch.restart();
 
-		printNumberOfQueriesExecuted(info_total.queries);
-		report(info_total);
-	}
+        /// Push queries into queue
+        for (size_t i = 0; !max_iterations || i < max_iterations; ++i)
+        {
+            size_t query_index = randomize ? distribution(generator) : i % queries.size();
 
+            if (!tryPushQueryInteractively(queries[query_index], interrupt_listener))
+                break;
+        }
 
-	void thread(ConnectionPool::Entry connection)
-	{
-		Query query;
+        shutdown = true;
+        pool.wait();
+        info_total.watch.stop();
 
-		try
-		{
-			try
-			{
-				/// В этих потоках не будем принимать сигнал INT.
-				sigset_t sig_set;
-				if (sigemptyset(&sig_set)
-					|| sigaddset(&sig_set, SIGINT)
-					|| pthread_sigmask(SIG_BLOCK, &sig_set, nullptr))
-					throwFromErrno("Cannot block signal.", ErrorCodes::CANNOT_BLOCK_SIGNAL);
+        if (!json_path.empty())
+            reportJSON(info_total, json_path);
 
-				while (true)
-				{
-					queue.pop(query);
-
-					/// Пустой запрос обозначает конец работы.
-					if (query.empty())
-						break;
-
-					execute(connection, query);
-				}
-			}
-			catch (const Exception & e)
-			{
-				std::string text = e.displayText();
-
-				std::cerr << "Code: " << e.code() << ". " << text << "\n\n";
-
-				/// Если есть стек-трейс на сервере, то не будем писать стек-трейс на клиенте.
-				if (std::string::npos == text.find("Stack trace"))
-					std::cerr << "Stack trace:\n"
-						<< e.getStackTrace().toString();
-
-				throw;
-			}
-			catch (const Poco::Exception & e)
-			{
-				std::cerr << "Poco::Exception: " << e.displayText() << "\n";
-				throw;
-			}
-			catch (const std::exception & e)
-			{
-				std::cerr << "std::exception: " << e.what() << "\n";
-				throw;
-			}
-			catch (...)
-			{
-				std::cerr << "Unknown exception\n";
-				throw;
-			}
-		}
-		catch (...)
-		{
-			std::cerr << "On query:\n" << query << "\n";
-			throw;
-		}
-	}
+        printNumberOfQueriesExecuted(info_total.queries);
+        report(info_total);
+    }
 
 
-	void execute(ConnectionPool::Entry & connection, Query & query)
-	{
-		Stopwatch watch;
-		RemoteBlockInputStream stream(connection, query, &settings, nullptr, Tables(), query_processing_stage);
+    void thread(ConnectionPool::Entry connection)
+    {
+        Query query;
 
-		Progress progress;
-		stream.setProgressCallback([&progress](const Progress & value) { progress.incrementPiecewiseAtomically(value); });
+        try
+        {
+            /// In these threads we do not accept INT signal.
+            sigset_t sig_set;
+            if (sigemptyset(&sig_set)
+                || sigaddset(&sig_set, SIGINT)
+                || pthread_sigmask(SIG_BLOCK, &sig_set, nullptr))
+                throwFromErrno("Cannot block signal.", ErrorCodes::CANNOT_BLOCK_SIGNAL);
 
-		stream.readPrefix();
-		while (Block block = stream.read())
-			;
-		stream.readSuffix();
+            while (true)
+            {
+                bool extracted = false;
 
-		const BlockStreamProfileInfo & info = stream.getProfileInfo();
+                while (!extracted)
+                {
+                    extracted = queue.tryPop(query, 100);
 
-		double seconds = watch.elapsedSeconds();
+                    if (shutdown)
+                        return;
+                }
 
-		std::lock_guard<std::mutex> lock(mutex);
-		info_per_interval.add(seconds, progress.rows, progress.bytes, info.rows, info.bytes);
-		info_total.add(seconds, progress.rows, progress.bytes, info.rows, info.bytes);
-	}
+                execute(connection, query);
+            }
+        }
+        catch (...)
+        {
+            shutdown = true;
+            std::cerr << "An error occurred while processing query:\n" << query << "\n";
+            throw;
+        }
+    }
 
 
-	void report(Stats & info)
-	{
-		std::lock_guard<std::mutex> lock(mutex);
+    void execute(ConnectionPool::Entry & connection, Query & query)
+    {
+        Stopwatch watch;
+        RemoteBlockInputStream stream(*connection, query, &settings, nullptr, Tables(), query_processing_stage);
 
-		double seconds = info.watch.elapsedSeconds();
+        Progress progress;
+        stream.setProgressCallback([&progress](const Progress & value) { progress.incrementPiecewiseAtomically(value); });
 
-		std::cerr
-			<< "\n"
-			<< "QPS: " << (info.queries / seconds) << ", "
-			<< "RPS: " << (info.read_rows / seconds) << ", "
-			<< "MiB/s: " << (info.read_bytes / seconds / 1048576) << ", "
-			<< "result RPS: " << (info.result_rows / seconds) << ", "
-			<< "result MiB/s: " << (info.result_bytes / seconds / 1048576) << "."
-			<< "\n";
+        stream.readPrefix();
+        while (Block block = stream.read())
+            ;
+        stream.readSuffix();
 
-		for (size_t percent = 0; percent <= 90; percent += 10)
-			std::cerr << percent << "%\t" << info.sampler.quantileInterpolated(percent / 100.0) << " sec." << std::endl;
+        const BlockStreamProfileInfo & info = stream.getProfileInfo();
 
-		std::cerr << "95%\t" 	<< info.sampler.quantileInterpolated(0.95) 	<< " sec.\n";
-		std::cerr << "99%\t" 	<< info.sampler.quantileInterpolated(0.99) 	<< " sec.\n";
-		std::cerr << "99.9%\t" 	<< info.sampler.quantileInterpolated(0.999) 	<< " sec.\n";
-		std::cerr << "99.99%\t" << info.sampler.quantileInterpolated(0.9999) << " sec.\n";
-		std::cerr << "100%\t" 	<< info.sampler.quantileInterpolated(1) 		<< " sec.\n";
+        double seconds = watch.elapsedSeconds();
 
-		info.clear();
-	}
+        std::lock_guard<std::mutex> lock(mutex);
+        info_per_interval.add(seconds, progress.rows, progress.bytes, info.rows, info.bytes);
+        info_total.add(seconds, progress.rows, progress.bytes, info.rows, info.bytes);
+    }
+
+
+    void report(Stats & info)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        /// Avoid zeros, nans or exceptions
+        if (0 == info.queries)
+            return;
+
+        double seconds = info.watch.elapsedSeconds();
+
+        std::cerr
+            << "\n"
+            << "QPS: " << (info.queries / seconds) << ", "
+            << "RPS: " << (info.read_rows / seconds) << ", "
+            << "MiB/s: " << (info.read_bytes / seconds / 1048576) << ", "
+            << "result RPS: " << (info.result_rows / seconds) << ", "
+            << "result MiB/s: " << (info.result_bytes / seconds / 1048576) << "."
+            << "\n";
+
+        auto print_percentile = [&](double percent)
+        {
+            std::cerr << percent << "%\t" << info.sampler.quantileInterpolated(percent / 100.0) << " sec." << std::endl;
+        };
+
+        for (int percent = 0; percent <= 90; percent += 10)
+            print_percentile(percent);
+
+        print_percentile(95);
+        print_percentile(99);
+        print_percentile(99.9);
+        print_percentile(99.99);
+
+        info.clear();
+    }
+
+    void reportJSON(Stats & info, const std::string & filename)
+    {
+        WriteBufferFromFile json_out(filename);
+
+        std::lock_guard<std::mutex> lock(mutex);
+
+        auto print_key_value = [&](auto key, auto value, bool with_comma = true)
+        {
+            json_out << double_quote << key << ": " << value << (with_comma ? ",\n" : "\n");
+        };
+
+        auto print_percentile = [&json_out, &info](auto percent, bool with_comma = true)
+        {
+            json_out << "\"" << percent << "\"" << ": " << info.sampler.quantileInterpolated(percent / 100.0) << (with_comma ? ",\n" : "\n");
+        };
+
+        json_out << "{\n";
+
+        json_out << double_quote << "statistics" << ": {\n";
+
+        double seconds = info.watch.elapsedSeconds();
+        print_key_value("QPS", info.queries / seconds);
+        print_key_value("RPS", info.read_rows / seconds);
+        print_key_value("MiBPS", info.read_bytes / seconds);
+        print_key_value("RPS_result", info.result_rows / seconds);
+        print_key_value("MiBPS_result", info.result_bytes / seconds);
+        print_key_value("num_queries", info.queries.load(), false);
+
+        json_out << "},\n";
+
+        json_out << double_quote << "query_time_percentiles" << ": {\n";
+
+        for (int percent = 0; percent <= 90; percent += 10)
+            print_percentile(percent);
+
+        print_percentile(95);
+        print_percentile(99);
+        print_percentile(99.9);
+        print_percentile(99.99, false);
+
+        json_out << "}\n";
+
+        json_out << "}\n";
+    }
+
+public:
+
+    ~Benchmark()
+    {
+        shutdown = true;
+    }
 };
 
 }
 
 
-int main(int argc, char ** argv)
+int mainEntryClickHouseBenchmark(int argc, char ** argv)
 {
-	using namespace DB;
+    using namespace DB;
+    bool print_stacktrace = true;
 
-	try
-	{
-		boost::program_options::options_description desc("Allowed options");
-		desc.add_options()
-			("help", "produce help message")
-			("concurrency,c", boost::program_options::value<unsigned>()->default_value(1), "number of parallel queries")
-			("delay,d", boost::program_options::value<double>()->default_value(1), "delay between reports in seconds")
-			("host,h", boost::program_options::value<std::string>()->default_value("localhost"), "")
-			("port", boost::program_options::value<UInt16>()->default_value(9000), "")
-			("user", boost::program_options::value<std::string>()->default_value("default"), "")
-			("password", boost::program_options::value<std::string>()->default_value(""), "")
-			("database", boost::program_options::value<std::string>()->default_value("default"), "")
-			("stage", boost::program_options::value<std::string>()->default_value("complete"), "request query processing up to specified stage")
-			("randomize,r", boost::program_options::value<bool>()->default_value(false), "randomize order of execution")
-		#define DECLARE_SETTING(TYPE, NAME, DEFAULT) (#NAME, boost::program_options::value<std::string> (), "Settings.h")
-		#define DECLARE_LIMIT(TYPE, NAME, DEFAULT) (#NAME, boost::program_options::value<std::string> (), "Limits.h")
-			APPLY_FOR_SETTINGS(DECLARE_SETTING)
-			APPLY_FOR_LIMITS(DECLARE_LIMIT)
-		#undef DECLARE_SETTING
-		#undef DECLARE_LIMIT
-		;
+    try
+    {
+        using boost::program_options::value;
 
-		boost::program_options::variables_map options;
-		boost::program_options::store(boost::program_options::parse_command_line(argc, argv, desc), options);
+        boost::program_options::options_description desc("Allowed options");
+        desc.add_options()
+            ("help",                                                                 "produce help message")
+            ("concurrency,c",    value<unsigned>()->default_value(1),                 "number of parallel queries")
+            ("delay,d",         value<double>()->default_value(1),                     "delay between intermediate reports in seconds (set 0 to disable reports)")
+            ("stage",            value<std::string>()->default_value("complete"),     "request query processing up to specified stage")
+            ("iterations,i",    value<size_t>()->default_value(0),                    "amount of queries to be executed")
+            ("timelimit,t",        value<double>()->default_value(0.),                 "stop launch of queries after specified time limit")
+            ("randomize,r",        value<bool>()->default_value(false),                "randomize order of execution")
+            ("json",            value<std::string>()->default_value(""),            "write final report to specified file in JSON format")
+            ("host,h",            value<std::string>()->default_value("localhost"),     "")
+            ("port",             value<UInt16>()->default_value(9000),                 "")
+            ("user",             value<std::string>()->default_value("default"),        "")
+            ("password",        value<std::string>()->default_value(""),             "")
+            ("database",        value<std::string>()->default_value("default"),     "")
+            ("stacktrace",                                                            "print stack traces of exceptions")
 
-		if (options.count("help"))
-		{
-			std::cout << "Usage: " << argv[0] << " [options] < queries.txt\n";
-			std::cout << desc << "\n";
-			return 1;
-		}
+        #define DECLARE_SETTING(TYPE, NAME, DEFAULT) (#NAME, boost::program_options::value<std::string> (), "Settings.h")
+        #define DECLARE_LIMIT(TYPE, NAME, DEFAULT) (#NAME, boost::program_options::value<std::string> (), "Limits.h")
+            APPLY_FOR_SETTINGS(DECLARE_SETTING)
+            APPLY_FOR_LIMITS(DECLARE_LIMIT)
+        #undef DECLARE_SETTING
+        #undef DECLARE_LIMIT
+        ;
 
-		/// Извлекаем settings and limits из полученных options
-		Settings settings;
+        boost::program_options::variables_map options;
+        boost::program_options::store(boost::program_options::parse_command_line(argc, argv, desc), options);
 
-		#define EXTRACT_SETTING(TYPE, NAME, DEFAULT) \
-		if (options.count(#NAME)) \
-			settings.set(#NAME, options[#NAME].as<std::string>());
-		APPLY_FOR_SETTINGS(EXTRACT_SETTING)
-		APPLY_FOR_LIMITS(EXTRACT_SETTING)
-		#undef EXTRACT_SETTING
+        if (options.count("help"))
+        {
+            std::cout << "Usage: " << argv[0] << " [options] < queries.txt\n";
+            std::cout << desc << "\n";
+            return 1;
+        }
 
-		Benchmark benchmark(
-			options["concurrency"].as<unsigned>(),
-			options["delay"].as<double>(),
-			options["host"].as<std::string>(),
-			options["port"].as<UInt16>(),
-			options["database"].as<std::string>(),
-			options["user"].as<std::string>(),
-			options["password"].as<std::string>(),
-			options["stage"].as<std::string>(),
-			options["randomize"].as<bool>(),
-			settings);
-	}
-	catch (const Exception & e)
-	{
-		std::string text = e.displayText();
+        print_stacktrace = options.count("stacktrace");
 
-		std::cerr << "Code: " << e.code() << ". " << text << "\n\n";
+        /// Extract `settings` and `limits` from received `options`
+        Settings settings;
 
-		/// Если есть стек-трейс на сервере, то не будем писать стек-трейс на клиенте.
-		if (std::string::npos == text.find("Stack trace"))
-			std::cerr << "Stack trace:\n"
-				<< e.getStackTrace().toString();
+        #define EXTRACT_SETTING(TYPE, NAME, DEFAULT) \
+        if (options.count(#NAME)) \
+            settings.set(#NAME, options[#NAME].as<std::string>());
+        APPLY_FOR_SETTINGS(EXTRACT_SETTING)
+        APPLY_FOR_LIMITS(EXTRACT_SETTING)
+        #undef EXTRACT_SETTING
 
-		return e.code();
-	}
-	catch (const Poco::Exception & e)
-	{
-		std::cerr << "Poco::Exception: " << e.displayText() << "\n";
-		return ErrorCodes::POCO_EXCEPTION;
-	}
-	catch (const std::exception & e)
-	{
-		std::cerr << "std::exception: " << e.what() << "\n";
-		return ErrorCodes::STD_EXCEPTION;
-	}
-	catch (...)
-	{
-		std::cerr << "Unknown exception\n";
-		return ErrorCodes::UNKNOWN_EXCEPTION;
-	}
+        Benchmark benchmark(
+            options["concurrency"].as<unsigned>(),
+            options["delay"].as<double>(),
+            options["host"].as<std::string>(),
+            options["port"].as<UInt16>(),
+            options["database"].as<std::string>(),
+            options["user"].as<std::string>(),
+            options["password"].as<std::string>(),
+            options["stage"].as<std::string>(),
+            options["randomize"].as<bool>(),
+            options["iterations"].as<size_t>(),
+            options["timelimit"].as<double>(),
+            options["json"].as<std::string>(),
+            settings);
+    }
+    catch (...)
+    {
+        std::cerr << getCurrentExceptionMessage(print_stacktrace, true) << std::endl;
+        return getCurrentExceptionCode();
+    }
+
+    return 0;
 }

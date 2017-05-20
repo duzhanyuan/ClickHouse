@@ -23,76 +23,66 @@ class ResultBase;
 class Row
 {
 private:
-	/** @brief Pointer to bool data member, for use by safe bool conversion operator.
-	  * @see http://www.artima.com/cppsource/safebool.html
-	  * Взято из mysql++.
-	  */
-	typedef MYSQL_ROW Row::*private_bool_type;
+    /** @brief Pointer to bool data member, for use by safe bool conversion operator.
+      * @see http://www.artima.com/cppsource/safebool.html
+      * Взято из mysql++.
+      */
+    typedef MYSQL_ROW Row::*private_bool_type;
 
 public:
-	/** Для возможности отложенной инициализации. */
-	Row()
-	{
-	}
+    /** Для возможности отложенной инициализации. */
+    Row()
+    {
+    }
 
-	/** Для того, чтобы создать Row, используйте соответствующие методы UseQueryResult или StoreQueryResult. */
-	Row(MYSQL_ROW row_, ResultBase * res_, MYSQL_LENGTHS lengths_)
-		: row(row_), res(res_), lengths(lengths_)
-	{
-	}
+    /** Для того, чтобы создать Row, используйте соответствующие методы UseQueryResult или StoreQueryResult. */
+    Row(MYSQL_ROW row_, ResultBase * res_, MYSQL_LENGTHS lengths_)
+        : row(row_), res(res_), lengths(lengths_)
+    {
+    }
 
-	/** Получить значение по индексу.
-	  * Здесь используется int, а не unsigned, чтобы не было неоднозначности с тем же методом, принимающим const char *.
-	  */
-	Value operator[] (int n) const
-	{
-		if (unlikely(static_cast<size_t>(n) >= res->getNumFields()))
-			throw Exception("Index of column is out of range.");
-		return Value(row[n], lengths[n], res);
-	}
+    /** Получить значение по индексу.
+      * Здесь используется int, а не unsigned, чтобы не было неоднозначности с тем же методом, принимающим const char *.
+      */
+    Value operator[] (int n) const
+    {
+        if (unlikely(static_cast<size_t>(n) >= res->getNumFields()))
+            throw Exception("Index of column is out of range.");
+        return Value(row[n], lengths[n], res);
+    }
 
-	/** Получить значение по имени. Слегка менее эффективно. */
-	Value operator[] (const char * name) const
-	{
-		unsigned n = res->getNumFields();
-		MYSQL_FIELDS fields = res->getFields();
+    /** Get value by column name. Less efficient. */
+    Value operator[] (const char * name) const;
 
-		for (unsigned i = 0; i < n; ++i)
-			if (!strcmp(name, fields[i].name))
-				return operator[](i);
+    Value operator[] (const std::string & name) const
+    {
+        return operator[](name.c_str());
+    }
 
-		throw Exception(std::string("Unknown column ") + name);
-	}
+    /** Получить значение по индексу. */
+    Value at(size_t n) const
+    {
+        return operator[](n);
+    }
 
-	Value operator[] (const std::string & name) const
-	{
-		return operator[](name.c_str());
-	}
+    /** Количество столбцов. */
+    size_t size() const { return res->getNumFields(); }
 
-	/** Получить значение по индексу. */
-	Value at(size_t n) const
-	{
-		return operator[](n);
-	}
+    /** Является ли пустым? Такой объект используется, чтобы обозначить конец результата
+      * при использовании UseQueryResult. Или это значит, что объект не инициализирован.
+      * Вы можете использовать вместо этого преобразование в bool.
+      */
+    bool empty() const { return row == nullptr; }
 
-	/** Количество столбцов. */
-	size_t size() const { return res->getNumFields(); }
-
-	/** Является ли пустым? Такой объект используется, чтобы обозначить конец результата
-	  * при использовании UseQueryResult. Или это значит, что объект не инициализирован.
-	  * Вы можете использовать вместо этого преобразование в bool.
-	  */
-	bool empty() const { return row == nullptr; }
-
-	/** Преобразование в bool.
-	  * (Точнее - в тип, который преобразуется в bool, и с которым больше почти ничего нельзя сделать.)
-	  */
-	operator private_bool_type() const	{ return row == nullptr ? NULL : &Row::row; }
+    /** Преобразование в bool.
+      * (Точнее - в тип, который преобразуется в bool, и с которым больше почти ничего нельзя сделать.)
+      */
+    operator private_bool_type() const    { return row == nullptr ? NULL : &Row::row; }
 
 private:
-	MYSQL_ROW row = nullptr;
-	ResultBase * res = nullptr;
-	MYSQL_LENGTHS lengths;
+    MYSQL_ROW row = nullptr;
+    ResultBase * res = nullptr;
+    MYSQL_LENGTHS lengths;
 };
 
 }

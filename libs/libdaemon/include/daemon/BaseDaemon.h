@@ -2,10 +2,13 @@
 
 #include <sys/types.h>
 #include <unistd.h>
-
 #include <iostream>
 #include <memory>
-
+#include <functional>
+#include <experimental/optional>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <Poco/Process.h>
 #include <Poco/ThreadPool.h>
 #include <Poco/TaskNotification.h>
@@ -15,15 +18,11 @@
 #include <Poco/Net/SocketAddress.h>
 #include <Poco/FileChannel.h>
 #include <Poco/SyslogChannel.h>
-
-#include <common/Common.h>
+#include <Poco/Version.h>
+#include <common/Types.h>
 #include <common/logger_useful.h>
-
 #include <daemon/GraphiteWriter.h>
-
-#include <boost/optional.hpp>
-#include <zkutil/ZooKeeperHolder.h>
-
+#include <Common/ConfigProcessor.h>
 
 namespace Poco { class TaskManager; }
 
@@ -52,145 +51,189 @@ namespace Poco { class TaskManager; }
 
 class BaseDaemon : public Poco::Util::ServerApplication
 {
-	friend class SignalListener;
+    friend class SignalListener;
 
 public:
-	BaseDaemon();
+    BaseDaemon();
     ~BaseDaemon();
 
-	/// Загружает конфигурацию и "строит" логгеры на запись в файлы
-	void initialize(Poco::Util::Application &) override;
+    /// Загружает конфигурацию и "строит" логгеры на запись в файлы
+    void initialize(Poco::Util::Application &) override;
 
-	/// Читает конфигурацию
-	void reloadConfiguration();
+    /// Читает конфигурацию
+    void reloadConfiguration();
 
-	/// Строит необходимые логгеры
-	void buildLoggers();
+    /// Строит необходимые логгеры
+    void buildLoggers();
 
-	/// Определяет параметр командной строки
-	void defineOptions(Poco::Util::OptionSet& _options) override;
+    /// Определяет параметр командной строки
+    void defineOptions(Poco::Util::OptionSet& _options) override;
 
-	/// Заставляет демон завершаться, если хотя бы одна задача завершилась неудачно
-	void exitOnTaskError();
+    /// Заставляет демон завершаться, если хотя бы одна задача завершилась неудачно
+    void exitOnTaskError();
 
-	/// Завершение демона ("мягкое")
-	void terminate();
+    /// Завершение демона ("мягкое")
+    void terminate();
 
-	/// Завершение демона ("жёсткое")
-	void kill();
+    /// Завершение демона ("жёсткое")
+    void kill();
 
-	/// Получен ли сигнал на завершение?
-	bool isCancelled()
-	{
-		return is_cancelled;
-	}
+    /// Получен ли сигнал на завершение?
+    bool isCancelled()
+    {
+        return is_cancelled;
+    }
 
-	/// Получение ссылки на экземпляр демона
-	static BaseDaemon & instance()
-	{
-		return dynamic_cast<BaseDaemon &>(Poco::Util::Application::instance());
-	}
+    /// Получение ссылки на экземпляр демона
+    static BaseDaemon & instance()
+    {
+        return dynamic_cast<BaseDaemon &>(Poco::Util::Application::instance());
+    }
 
-	/// Спит заданное количество секунд или до события wakeup
-	void sleep(double seconds);
+    /// return none if daemon doesn't exist, reference to the daemon otherwise
+    static std::experimental::optional<std::reference_wrapper<BaseDaemon>> tryGetInstance() { return tryGetInstance<BaseDaemon>(); }
 
-	/// Разбудить
-	void wakeup();
+    /// Спит заданное количество секунд или до события wakeup
+    void sleep(double seconds);
 
-	/// Закрыть файлы с логами. При следующей записи, будут созданы новые файлы.
-	void closeLogs();
+    /// Разбудить
+    void wakeup();
 
-	/// В Graphite компоненты пути(папки) разделяются точкой.
-	/// У нас принят путь формата root_path.hostname_yandex_ru.key
-	/// root_path по умолчанию one_min
-	/// key - лучше группировать по смыслу. Например "meminfo.cached" или "meminfo.free", "meminfo.total"
-	template <class T>
-	void writeToGraphite(const std::string & key, const T & value, time_t timestamp = 0, const std::string & custom_root_path = "")
-	{
-		graphite_writer->write(key, value, timestamp, custom_root_path);
-	}
+    /// Закрыть файлы с логами. При следующей записи, будут созданы новые файлы.
+    void closeLogs();
 
-	template <class T>
-	void writeToGraphite(const GraphiteWriter::KeyValueVector<T> & key_vals, time_t timestamp = 0, const std::string & custom_root_path = "")
-	{
-		graphite_writer->write(key_vals, timestamp, custom_root_path);
-	}
+    /// В Graphite компоненты пути(папки) разделяются точкой.
+    /// У нас принят путь формата root_path.hostname_yandex_ru.key
+    /// root_path по умолчанию one_min
+    /// key - лучше группировать по смыслу. Например "meminfo.cached" или "meminfo.free", "meminfo.total"
+    template <class T>
+    void writeToGraphite(const std::string & key, const T & value, const std::string & config_name = "graphite", time_t timestamp = 0, const std::string & custom_root_path = "")
+    {
+        auto writer = getGraphiteWriter(config_name);
+        if (writer)
+            writer->write(key, value, timestamp, custom_root_path);
+    }
 
-	GraphiteWriter * getGraphiteWriter() { return graphite_writer.get(); }
+    template <class T>
+    void writeToGraphite(const GraphiteWriter::KeyValueVector<T> & key_vals, const std::string & config_name = "graphite", time_t timestamp = 0, const std::string & custom_root_path = "")
+    {
+        auto writer = getGraphiteWriter(config_name);
+        if (writer)
+            writer->write(key_vals, timestamp, custom_root_path);
+    }
 
-	boost::optional<size_t> getLayer() const
-	{
-		return layer;	/// layer выставляется в классе-наследнике BaseDaemonApplication.
-	}
+    GraphiteWriter * getGraphiteWriter(const std::string & config_name = "graphite")
+    {
+        if (graphite_writers.count(config_name))
+            return graphite_writers[config_name].get();
+        return nullptr;
+    }
+
+    std::experimental::optional<size_t> getLayer() const
+    {
+        return layer;    /// layer выставляется в классе-наследнике BaseDaemonApplication.
+    }
 
 protected:
-	/// Возвращает TaskManager приложения
-	/// все методы task_manager следует вызывать из одного потока
-	/// иначе возможен deadlock, т.к. joinAll выполняется под локом, а любой метод тоже берет лок
-	Poco::TaskManager & getTaskManager() { return *task_manager; }
+    /// Возвращает TaskManager приложения
+    /// все методы task_manager следует вызывать из одного потока
+    /// иначе возможен deadlock, т.к. joinAll выполняется под локом, а любой метод тоже берет лок
+    Poco::TaskManager & getTaskManager() { return *task_manager; }
 
-	virtual void logRevision() const;
+    virtual void logRevision() const;
 
-	/// Используется при exitOnTaskError()
-	void handleNotification(Poco::TaskFailedNotification *);
+    /// Используется при exitOnTaskError()
+    void handleNotification(Poco::TaskFailedNotification *);
 
-	/// thread safe
-	virtual void handleSignal(int signal_id);
+    /// thread safe
+    virtual void handleSignal(int signal_id);
 
-	/// реализация обработки сигналов завершения через pipe не требует блокировки сигнала с помощью sigprocmask во всех потоках
-	void waitForTerminationRequest() override;
-	/// thread safe
-	virtual void onInterruptSignals(int signal_id);
+    /// реализация обработки сигналов завершения через pipe не требует блокировки сигнала с помощью sigprocmask во всех потоках
+    void waitForTerminationRequest()
+#if POCO_CLICKHOUSE_PATCH || POCO_VERSION >= 0x02000000 // in old upstream poco not vitrual
+    override
+#endif
+    ;
+    /// thread safe
+    virtual void onInterruptSignals(int signal_id);
 
-	std::unique_ptr<Poco::TaskManager> task_manager;
+    template <class Daemon>
+    static std::experimental::optional<std::reference_wrapper<Daemon>> tryGetInstance();
 
-	/// Создание и автоматическое удаление pid файла.
-	struct PID
-	{
-		std::string file;
+    virtual std::string getDefaultCorePath() const;
 
-		/// Создать объект, не создавая PID файл
-		PID() {}
+    std::unique_ptr<Poco::TaskManager> task_manager;
 
-		/// Создать объект, создать PID файл
-		PID(const std::string & file_) { seed(file_); }
+    /// Создание и автоматическое удаление pid файла.
+    struct PID
+    {
+        std::string file;
 
-		/// Создать PID файл
-		void seed(const std::string & file_);
+        /// Создать объект, не создавая PID файл
+        PID() {}
 
-		/// Удалить PID файл
-		void clear();
+        /// Создать объект, создать PID файл
+        PID(const std::string & file_) { seed(file_); }
 
-		~PID() { clear(); }
-	};
+        /// Создать PID файл
+        void seed(const std::string & file_);
 
-	PID pid;
+        /// Удалить PID файл
+        void clear();
 
-	std::atomic_bool is_cancelled{false};
+        ~PID() { clear(); }
+    };
 
-	/// Флаг устанавливается по сообщению из Task (при аварийном завершении).
-	bool task_failed = false;
+    PID pid;
 
-	bool log_to_console = false;
+    std::atomic_bool is_cancelled{false};
 
-	/// Событие, чтобы проснуться во время ожидания
-	Poco::Event wakeup_event;
+    /// Флаг устанавливается по сообщению из Task (при аварийном завершении).
+    bool task_failed = false;
 
-	/// Поток, в котором принимается сигнал HUP/USR1 для закрытия логов.
-	Poco::Thread signal_listener_thread;
-	std::unique_ptr<Poco::Runnable> signal_listener;
+    bool log_to_console = false;
 
-	/// Файлы с логами.
-	Poco::AutoPtr<Poco::FileChannel> log_file;
-	Poco::AutoPtr<Poco::FileChannel> error_log_file;
-	Poco::AutoPtr<Poco::SyslogChannel> syslog_channel;
+    /// Событие, чтобы проснуться во время ожидания
+    Poco::Event wakeup_event;
 
-	std::unique_ptr<GraphiteWriter> graphite_writer;
+    /// Поток, в котором принимается сигнал HUP/USR1 для закрытия логов.
+    Poco::Thread signal_listener_thread;
+    std::unique_ptr<Poco::Runnable> signal_listener;
 
-	boost::optional<size_t> layer;
+    /// Файлы с логами.
+    Poco::AutoPtr<Poco::FileChannel> log_file;
+    Poco::AutoPtr<Poco::FileChannel> error_log_file;
+    Poco::AutoPtr<Poco::SyslogChannel> syslog_channel;
 
-	std::mutex signal_handler_mutex;
-	std::condition_variable signal_event;
-	std::atomic_size_t terminate_signals_counter{0};
-	std::atomic_size_t sigint_signals_counter{0};
+    std::map<std::string, std::unique_ptr<GraphiteWriter>> graphite_writers;
+
+    std::experimental::optional<size_t> layer;
+
+    std::mutex signal_handler_mutex;
+    std::condition_variable signal_event;
+    std::atomic_size_t terminate_signals_counter{0};
+    std::atomic_size_t sigint_signals_counter{0};
+
+    std::string config_path;
+    ConfigProcessor::LoadedConfig loaded_config;
 };
+
+
+template <class Daemon>
+std::experimental::optional<std::reference_wrapper<Daemon>> BaseDaemon::tryGetInstance()
+{
+    Daemon * ptr = nullptr;
+    try
+    {
+        ptr = dynamic_cast<Daemon *>(&Poco::Util::Application::instance());
+    }
+    catch (const Poco::NullPointerException &)
+    {
+        /// if daemon doesn't exist than instance() throw NullPointerException
+    }
+
+    if (ptr)
+        return std::experimental::optional<std::reference_wrapper<Daemon>>(*ptr);
+    else
+        return {};
+}

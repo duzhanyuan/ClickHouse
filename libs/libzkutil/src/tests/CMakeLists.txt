@@ -1,6 +1,3 @@
-add_executable(zkutil_test zkutil_test.cpp)
-target_link_libraries(zkutil_test zkutil dbms readline)
-
 add_executable(zkutil_test_commands zkutil_test_commands.cpp)
 target_link_libraries(zkutil_test_commands zkutil dbms)
 
@@ -15,3 +12,6 @@ target_link_libraries(zkutil_test_async zkutil dbms)
 
 add_executable(zkutil_zookeeper_holder zkutil_zookeeper_holder.cpp)
 target_link_libraries(zkutil_zookeeper_holder zkutil dbms)
+
+add_executable (zk_many_watches_reconnect zk_many_watches_reconnect.cpp)
+target_link_libraries (zk_many_watches_reconnect zkutil dbms)

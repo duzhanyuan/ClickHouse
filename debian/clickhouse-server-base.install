@@ -1,4 +1,5 @@
-/usr/bin/clickhouse-server
+/usr/bin/clickhouse
+/etc/init.d/clickhouse-server
 /etc/cron.d/clickhouse-server
-/etc/security/limits.d/metrika.conf
 /usr/share/clickhouse/*
+/etc/security/limits.d/clickhouse.conf

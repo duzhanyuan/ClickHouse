@@ -4,123 +4,157 @@
 #include <functional>
 #include <memory>
 #include <common/logger_useful.h>
+#include <Common/CurrentMetrics.h>
+
+
+namespace ProfileEvents
+{
+    extern const Event ObsoleteEphemeralNode;
+    extern const Event LeaderElectionAcquiredLeadership;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric LeaderElection;
+}
 
 
 namespace zkutil
 {
 
-/** Реализует метод выбора лидера, описанный здесь: http://zookeeper.apache.org/doc/r3.4.5/recipes.html#sc_leaderElection
+/** Implements leader election algorithm described here: http://zookeeper.apache.org/doc/r3.4.5/recipes.html#sc_leaderElection
   */
 class LeaderElection
 {
 public:
-	using LeadershipHandler = std::function<void()>;
+    using LeadershipHandler = std::function<void()>;
 
-	/** handler вызывается, когда этот экземпляр становится лидером.
-	  */
-	LeaderElection(const std::string & path_, ZooKeeper & zookeeper_, LeadershipHandler handler_, const std::string & identifier_ = "")
-		: path(path_), zookeeper(zookeeper_), handler(handler_), identifier(identifier_),
-		log(&Logger::get("LeaderElection"))
-	{
-		node = EphemeralNodeHolder::createSequential(path + "/leader_election-", zookeeper, identifier);
+    /** handler is called when this instance become leader.
+      *
+      * identifier - if not empty, must uniquely (within same path) identify participant of leader election.
+      * It means that different participants of leader election have different identifiers
+      *  and existence of more than one ephemeral node with same identifier indicates an error
+      *  (see cleanOldEphemeralNodes).
+      */
+    LeaderElection(const std::string & path_, ZooKeeper & zookeeper_, LeadershipHandler handler_, const std::string & identifier_ = "")
+        : path(path_), zookeeper(zookeeper_), handler(handler_), identifier(identifier_)
+    {
+        createNode();
+    }
 
-		std::string node_path = node->getPath();
-		node_name = node_path.substr(node_path.find_last_of('/') + 1);
+    void yield()
+    {
+        releaseNode();
+        createNode();
+    }
 
-		thread = std::thread(&LeaderElection::threadFunction, this);
-	}
-
-	enum State
-	{
-		WAITING_LEADERSHIP,
-		LEADER,
-		LEADERSHIP_LOST
-	};
-
-	/// если возвращает LEADER, то еще sessionTimeoutMs мы будем лидером, даже если порвется соединение с zookeeper
-	State getState()
-	{
-		if (state == LEADER)
-		{
-			try
-			{
-				/// возможно, если сессия разорвалась и заново был вызван init
-				if (!zookeeper.exists(node->getPath()))
-				{
-					LOG_WARNING(log, "Leadership lost. Node " << node->getPath() << " doesn't exist.");
-					state = LEADERSHIP_LOST;
-				}
-			}
-			catch (const KeeperException & e)
-			{
-				LOG_WARNING(log, "Leadership lost. e.message() = " << e.message());
-				state = LEADERSHIP_LOST;
-			}
-		}
-
-		return state;
-
-	}
-
-	~LeaderElection()
-	{
-		shutdown = true;
-		event->set();
-		thread.join();
-	}
+    ~LeaderElection()
+    {
+        releaseNode();
+    }
 
 private:
-	std::string path;
-	ZooKeeper & zookeeper;
-	LeadershipHandler handler;
-	std::string identifier;
+    std::string path;
+    ZooKeeper & zookeeper;
+    LeadershipHandler handler;
+    std::string identifier;
 
-	EphemeralNodeHolderPtr node;
-	std::string node_name;
+    EphemeralNodeHolderPtr node;
+    std::string node_name;
 
-	std::thread thread;
-	volatile bool shutdown = false;
-	zkutil::EventPtr event = std::make_shared<Poco::Event>();
+    std::thread thread;
+    std::atomic<bool> shutdown {false};
+    zkutil::EventPtr event = std::make_shared<Poco::Event>();
 
-	State state = WAITING_LEADERSHIP;
+    CurrentMetrics::Increment metric_increment{CurrentMetrics::LeaderElection};
 
-	Logger * log;
+    void createNode()
+    {
+        shutdown = false;
+        node = EphemeralNodeHolder::createSequential(path + "/leader_election-", zookeeper, identifier);
 
-	void threadFunction()
-	{
-		while (!shutdown)
-		{
-			bool success = false;
+        std::string node_path = node->getPath();
+        node_name = node_path.substr(node_path.find_last_of('/') + 1);
 
-			try
-			{
-				Strings children = zookeeper.getChildren(path);
-				std::sort(children.begin(), children.end());
-				auto it = std::lower_bound(children.begin(), children.end(), node_name);
-				if (it == children.end() || *it != node_name)
-					throw Poco::Exception("Assertion failed in LeaderElection");
+        cleanOldEphemeralNodes();
 
-				if (it == children.begin())
-				{
-					state = LEADER;
-					handler();
-					return;
-				}
+        thread = std::thread(&LeaderElection::threadFunction, this);
+    }
 
-				if (zookeeper.exists(path + "/" + *(it - 1), nullptr, event))
-					event->wait();
+    void cleanOldEphemeralNodes()
+    {
+        if (identifier.empty())
+            return;
 
-				success = true;
-			}
-			catch (...)
-			{
-				DB::tryLogCurrentException("LeaderElection");
-			}
+        /** If there are nodes with same identifier, remove them.
+          * Such nodes could still be alive after failed attempt of removal,
+          *  if it was temporary communication failure, that was continued for more than session timeout,
+          *  but ZK session is still alive for unknown reason, and someone still holds that ZK session.
+          * See comments in destructor of EphemeralNodeHolder.
+          */
+        Strings brothers = zookeeper.getChildren(path);
+        for (const auto & brother : brothers)
+        {
+            if (brother == node_name)
+                continue;
 
-			if (!success)
-				event->tryWait(10 * 1000);
-		}
-	}
+            std::string brother_path = path + "/" + brother;
+            std::string brother_identifier = zookeeper.get(brother_path);
+
+            if (brother_identifier == identifier)
+            {
+                ProfileEvents::increment(ProfileEvents::ObsoleteEphemeralNode);
+                LOG_WARNING(&Logger::get("LeaderElection"), "Found obsolete ephemeral node for identifier "
+                    + identifier + ", removing: " + brother_path);
+                zookeeper.tryRemoveWithRetries(brother_path);
+            }
+        }
+    }
+
+    void releaseNode()
+    {
+        shutdown = true;
+        event->set();
+        if (thread.joinable())
+            thread.join();
+        node = nullptr;
+    }
+
+    void threadFunction()
+    {
+        while (!shutdown)
+        {
+            bool success = false;
+
+            try
+            {
+                Strings children = zookeeper.getChildren(path);
+                std::sort(children.begin(), children.end());
+                auto it = std::lower_bound(children.begin(), children.end(), node_name);
+                if (it == children.end() || *it != node_name)
+                    throw Poco::Exception("Assertion failed in LeaderElection");
+
+                if (it == children.begin())
+                {
+                    ProfileEvents::increment(ProfileEvents::LeaderElectionAcquiredLeadership);
+                    handler();
+                    return;
+                }
+
+                if (zookeeper.exists(path + "/" + *(it - 1), nullptr, event))
+                    event->wait();
+
+                success = true;
+            }
+            catch (...)
+            {
+                DB::tryLogCurrentException("LeaderElection");
+            }
+
+            if (!success)
+                event->tryWait(10 * 1000);
+        }
+    }
 };
 
 using LeaderElectionPtr = std::shared_ptr<LeaderElection>;

@@ -1,55 +1,61 @@
-#include <DB/DataStreams/ODBCDriverBlockOutputStream.h>
+#include <IO/WriteBuffer.h>
+#include <IO/WriteHelpers.h>
+#include <Core/Block.h>
+#include <DataStreams/ODBCDriverBlockOutputStream.h>
+
 
 namespace DB
 {
 
-ODBCDriverBlockOutputStream::ODBCDriverBlockOutputStream(WriteBuffer & out_)
-	: out(out_) {}
+ODBCDriverBlockOutputStream::ODBCDriverBlockOutputStream(WriteBuffer & out_, const Block & sample_)
+    : out(out_)
+    , sample(sample_)
+{
+}
 
 void ODBCDriverBlockOutputStream::flush()
 {
-	out.next();
+    out.next();
 }
 
 void ODBCDriverBlockOutputStream::write(const Block & block)
 {
-	size_t rows = block.rows();
-	size_t columns = block.columns();
+    const size_t rows = block.rows();
+    const size_t columns = block.columns();
+    String text_value;
 
-	/// Заголовок.
-	if (is_first)
-	{
-		is_first = false;
+    for (size_t i = 0; i < rows; ++i)
+    {
+        for (size_t j = 0; j < columns; ++j)
+        {
+            text_value.resize(0);
+            const ColumnWithTypeAndName & col = block.getByPosition(j);
 
-		/// Количество столбцов.
-		writeVarUInt(columns, out);
+            {
+                WriteBufferFromString text_out(text_value);
+                col.type->serializeText(*col.column.get(), i, text_out);
+            }
 
-		/// Имена и типы столбцов.
-		for (size_t j = 0; j < columns; ++j)
-		{
-			const ColumnWithTypeAndName & col = block.unsafeGetByPosition(j);
+            writeStringBinary(text_value, out);
+        }
+    }
+}
 
-			writeStringBinary(col.name, out);
-			writeStringBinary(col.type->getName(), out);
-		}
-	}
+void ODBCDriverBlockOutputStream::writePrefix()
+{
+    const size_t columns = sample.columns();
 
-	String text_value;
-	for (size_t i = 0; i < rows; ++i)
-	{
-		for (size_t j = 0; j < columns; ++j)
-		{
-			text_value.resize(0);
-			const ColumnWithTypeAndName & col = block.unsafeGetByPosition(j);
+    /// Number of columns.
+    writeVarUInt(columns, out);
 
-			{
-				WriteBufferFromString text_out(text_value);
-				col.type->serializeText(*col.column.get(), i, text_out);
-			}
+    /// Names and types of columns.
+    for (size_t i = 0; i < columns; ++i)
+    {
+        const ColumnWithTypeAndName & col = sample.getByPosition(i);
 
-			writeStringBinary(text_value, out);
-		}
-	}
+        writeStringBinary(col.name, out);
+        writeStringBinary(col.type->getName(), out);
+    }
 }
 
 }

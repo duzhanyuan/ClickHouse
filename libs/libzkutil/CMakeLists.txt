@@ -1,11 +1,17 @@
-add_library(zkutil
-	src/ZooKeeper.cpp
-	src/Lock.cpp
-	src/SingleBarrier.cpp
-	src/RWLock.cpp
-	src/ZooKeeperHolder.cpp
+include_directories (include)
+include_directories (${ClickHouse_SOURCE_DIR}/libs/libcommon/include)
 
-	include/zkutil/Increment.h
+include(${ClickHouse_SOURCE_DIR}/cmake/dbms_include.cmake)
+
+add_library(zkutil
+    src/ZooKeeper.cpp
+    src/Lock.cpp
+    src/SingleBarrier.cpp
+    src/RWLock.cpp
+    src/ZooKeeperHolder.cpp
+    src/ZooKeeperNodeCache.cpp
+
+    include/zkutil/Increment.h
     include/zkutil/LeaderElection.h
     include/zkutil/KeeperException.h
     include/zkutil/Common.h
@@ -14,8 +20,13 @@ add_library(zkutil
     include/zkutil/RWLock.h
     include/zkutil/ZooKeeper.h
     include/zkutil/Types.h
-    include/zkutil/ZooKeeperHolder.h)
+    include/zkutil/ZooKeeperHolder.h
+    include/zkutil/ZooKeeperNodeCache.h)
 
-target_link_libraries(zkutil zookeeper pthread PocoFoundation string_utils)
+find_package (Threads)
+
+target_link_libraries(zkutil ${ZOOKEEPER_LIBRARY} ${Poco_Foundation_LIBRARY} ${CMAKE_THREAD_LIBS_INIT} string_utils)
 
 add_subdirectory (src)
+
+add_subdirectory (zookeeper-cli)
