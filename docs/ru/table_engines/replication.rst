@@ -67,6 +67,8 @@ ReplicatedSummingMergeTree
 
 Система следит за синхронностью данных на репликах и умеет восстанавливаться после сбоя. Восстановление после сбоя автоматическое (в случае небольших различий в данных) или полуавтоматическое (когда данные отличаются слишком сильно, что может свидетельствовать об ошибке конфигурации).
 
+.. _table_engines-replication-creation_of_rep_tables:
+
 Создание реплицируемых таблиц
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -74,7 +76,9 @@ ReplicatedSummingMergeTree
 
 Также добавляются два параметра в начало списка параметров - путь к таблице в ZooKeeper, имя реплики в ZooKeeper.
 
-Пример: ::
+Пример:
+
+.. code-block:: text
 
   ReplicatedMergeTree('/clickhouse/tables/{layer}-{shard}/hits', '{replica}', EventDate, intHash32(UserID), (CounterID, EventDate, intHash32(UserID), EventTime), 8192)
 
@@ -159,7 +163,7 @@ ReplicatedSummingMergeTree
 
 Переименуйте имеющуюся MergeTree таблицу, затем создайте со старым именем таблицу типа ReplicatedMergeTree.
 Перенесите данные из старой таблицы в поддиректорию detached в директории с данными новой таблицы (``/var/lib/clickhouse/data/db_name/table_name/``).
-Затем добавьте эти куски данных в рабочий набор с помощью выполнения запросов ALTER TABLE ATTACH PART на одной из реплик.
+Затем добавьте эти куски данных в рабочий набор с помощью выполнения запросов ALTER TABLE ATTACH PARTITION на одной из реплик.
 
 Преобразование из ReplicatedMergeTree в MergeTree
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -1,7 +1,9 @@
+.. _table_engines-resharding:
+
 Перешардирование
 ----------------
 
-.. code-block:: sql
+.. code-block:: text
 
   ALTER TABLE t RESHARD [COPY] [PARTITION partition] TO описание кластера USING ключ шардирования
 

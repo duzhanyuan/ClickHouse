@@ -87,6 +87,9 @@ public:
     /// Approximate number of bytes in memory - for profiling and limits.
     size_t bytes() const;
 
+    /// Approximate number of allocated bytes in memory - for profiling and limits.
+    size_t allocatedBytes() const;
+
     operator bool() const { return !data.empty(); }
     bool operator!() const { return data.empty(); }
 
@@ -118,6 +121,12 @@ public:
       * Also unsharing columns, if whole columns are shared_ptrs pointing to same instances.
       */
     void unshareColumns();
+
+    /** Updates SipHash of the Block, using update method of columns.
+      * Returns hash for block, that could be used to differentiate blocks
+      *  with same structure, but different data.
+      */
+    void updateHash(SipHash & hash) const;
 
 private:
     void eraseImpl(size_t position);

@@ -1,5 +1,7 @@
 #include <IO/ConcatReadBuffer.h>
 
+#include <Common/typeid_cast.h>
+
 #include <DataStreams/ProhibitColumnsBlockOutputStream.h>
 #include <DataStreams/MaterializingBlockOutputStream.h>
 #include <DataStreams/AddingDefaultBlockOutputStream.h>
@@ -33,7 +35,7 @@ namespace ErrorCodes
 }
 
 
-InterpreterInsertQuery::InterpreterInsertQuery(ASTPtr query_ptr_, Context & context_)
+InterpreterInsertQuery::InterpreterInsertQuery(const ASTPtr & query_ptr_, const Context & context_)
     : query_ptr(query_ptr_), context(context_)
 {
     ProfileEvents::increment(ProfileEvents::InsertQuery);
@@ -84,14 +86,14 @@ BlockIO InterpreterInsertQuery::execute()
     ASTInsertQuery & query = typeid_cast<ASTInsertQuery &>(*query_ptr);
     StoragePtr table = getTable();
 
-    auto table_lock = table->lockStructure(true);
+    auto table_lock = table->lockStructure(true, __PRETTY_FUNCTION__);
 
     NamesAndTypesListPtr required_columns = std::make_shared<NamesAndTypesList>(table->getColumnsList());
 
     /// We create a pipeline of several streams, into which we will write data.
     BlockOutputStreamPtr out;
 
-    out = std::make_shared<PushingToViewsBlockOutputStream>(query.database, query.table, context, query_ptr);
+    out = std::make_shared<PushingToViewsBlockOutputStream>(query.database, query.table, context, query_ptr, query.no_destination);
 
     out = std::make_shared<MaterializingBlockOutputStream>(out);
 
@@ -124,7 +126,7 @@ BlockIO InterpreterInsertQuery::execute()
         res.in = interpreter_select.execute().in;
 
         res.in = std::make_shared<NullableAdapterBlockInputStream>(res.in, res.in_sample, res.out_sample);
-        res.in = std::make_shared<CastTypeBlockInputStream>(context, res.in, res.in_sample, res.out_sample);
+        res.in = std::make_shared<CastTypeBlockInputStream>(context, res.in, res.out_sample);
         res.in = std::make_shared<NullAndDoCopyBlockInputStream>(res.in, out);
     }
 

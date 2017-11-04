@@ -1,3 +1,5 @@
+.. _table_engines-graphitemergetree:
+
 GraphiteMergeTree
 -----------------
 
@@ -13,7 +15,7 @@ Graphite хранит в ClickHouse полные данные, а получат
   
   Используется движок ``GraphiteMergeTree``.
 
-Движок наследует свойства `MergeTree`. Настройки прореживания данных размещаются в :ref:`общей конфигурации <configuration_files>` ClickHouse (config.xml).
+Движок наследует свойства `MergeTree`. Настройки прореживания данных задаются параметром :ref:`server_settings-graphite_rollup` в конфигурации сервера .
 
 Использование движка
 ^^^^^^^^^^^^^^^^^^^^
@@ -25,7 +27,9 @@ Graphite хранит в ClickHouse полные данные, а получат
 * ``Value`` - значение метрики в момент времени Time.
 * ``Version`` - настройка, которая определяет какое значение метрики с одинаковыми Path и Time останется в базе.
 
-Шаблон правил rollup: ::
+Шаблон правил rollup:
+
+.. code-block:: text
 
 	pattern
         regexp
